@@ -1,0 +1,14 @@
+{
+  "name": "@timhaines/preview-e2e-fixture",
+  "version": "0.0.0",
+  "description": "Placeholder for a CI end-to-end test fixture.",
+  "license": "MIT",
+  "main": "index.js",
+  "files": [
+    "index.js"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WF-Rugged/preview-e2e-cf5af4.git"
+  }
+}

@@ -1,0 +1,16 @@
+.site-nav {
+  display: flex;
+  gap: 1.5rem;
+  padding: 0.75rem 1rem;
+  align-items: center;
+}
+
+.site-nav a {
+  color: #444;
+  text-decoration: none;
+}
+
+.site-nav a[aria-current='page'] {
+  color: #111;
+  border-bottom: 2px solid #111;
+}
